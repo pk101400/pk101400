@@ -1,0 +1,248 @@
+# ✅ 1. 데이터 로딩 및 전처리
+!git clone https://github.com/ZIZUN/korean-malicious-comments-dataset.git
+
+import pandas as pd
+
+file_path = "/content/korean-malicious-comments-dataset/Dataset.csv"
+df = pd.read_csv(file_path, sep="\t") #탭 구분자 주의
+df = df.dropna(subset=["content", "lable"])
+print("데이터 크기:", df.shape)
+print(df.head())
+
+#결측치 제거 및 라벨 int 변환
+df = df.dropna(subset=["content", "lable"])
+df["lable"] = df["lable"].astype(int)
+
+# ✅ 2. 데이터 분할
+from sklearn.model_selection import train_test_split
+
+train_texts, val_texts, train_labels, val_labels = train_test_split(
+    df["content"].tolist(),
+    df["lable"].tolist(),
+    test_size=0.2,
+    random_state=42
+)
+
+print("학습 샘플 수:", len(train_texts))
+print("검증 샘플 수:", len(val_texts))
+
+# ✅ 3. 토큰화 및 데이터셋 생성
+from transformers import AutoTokenizer
+import torch
+
+model_name = "monologg/koelectra-small-discriminator"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+def tokenize_fn(texts):
+    return tokenizer(texts, padding="max_length", truncation=True, max_length=128, return_tensors="pt")
+
+train_encodings = tokenize_fn(train_texts)
+val_encodings = tokenize_fn(val_texts)
+
+class CommentDataset(torch.utils.data.Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        item = {key: val[idx] for key, val in self.encodings.items()}
+        item["labels"] = torch.tensor(self.labels[idx])
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
+train_dataset = CommentDataset(train_encodings, train_labels)
+val_dataset = CommentDataset(val_encodings, val_labels)
+
+
+
+
+
+# ✅ 4. 모델 학습
+from torch.utils.data import DataLoader
+from transformers import AutoModelForSequenceClassification
+from torch.optim import AdamW
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
+
+#DataLoader 설정
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+#4, 옵티마이저 정의
+optimizer = AdamW(model.parameters(), lr=2e-5)
+
+#5, 학습 함수 정의
+def train_epoch(model, dataloader, optimizer):
+    model.train()
+    losses = []
+    loop = tqdm(dataloader, leave=False)
+    for batch in loop:
+        optimizer.zero_grad()
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        losses.append(loss.item())
+        loss.backward()
+        optimizer.step()
+        loop.set_description(f"Training Loss: {loss.item():.4f}")
+    return sum(losses) / len(losses)
+
+#6, 평가 함수 정의
+def evaluate(model, dataloader):
+    model.eval()
+    correct = 0
+    total = 0
+    loop = tqdm(dataloader, leave=False)
+    with torch.no_grad():
+        for batch in loop:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            outputs = model(input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            preds = torch.argmax(logits, dim=-1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            loop.set_description(f"Eval Acc: {correct/total:.4f}")
+    return correct / total
+
+
+#7, 실제 학습 실행(3 epoch)
+for epoch in range(3):
+    print(f"Epoch {epoch+1}/3")
+    train_loss = train_epoch(model, train_loader, optimizer)
+    val_acc = evaluate(model, val_loader)
+    print(f"Train Loss: {train_loss:.4f} | Val Accuracy: {val_acc:.4f}")
+
+def predict_comment(text, model, tokenizer):
+    model.eval()
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = torch.nn.functional.softmax(outputs.logits, dim=1).squeeze().tolist()
+        pred = torch.argmax(torch.tensor(probs)).item()
+    return pred, probs
+
+import matplotlib.pyplot as plt
+
+def plot_probs(probs, labels=["Malicious", "Normal"]):
+    plt.figure(figsize=(6, 4))
+    plt.bar(labels, probs)
+    plt.ylim(0, 1)
+    plt.title("Prediction Probabilities")
+    plt.ylabel("Probability")
+    plt.show()
+
+
+# ✅ 5. 모델 저장
+model.save_pretrained("./trained_model")
+tokenizer.save_pretrained("./trained_model")
+
+# trained_model 폴더를 ZIP으로 압축해서 trained_model.zip 을 생성
+!zip -r trained_model.zip trained_model
+
+
+#압축 파일을 로컬로 다운로드
+from google.colab import files
+files.download("trained_model.zip")
+
+
+requirements_content = """\
+streamlit==1.34.0
+transformers==4.41.2
+torch
+matplotlib
+sentencepiece
+"""
+
+with open("requirements.txt", "w") as f:
+    f.write(requirements_content)
+
+
+app_py_content = '''
+import streamlit as st
+import torch
+import matplotlib.pyplot as plt
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+@st.cache_resource
+def load_model_tokenizer():
+    model = AutoModelForSequenceClassification.from_pretrained("trained_model")
+    tokenizer = AutoTokenizer.from_pretrained("trained_model")
+    model.eval()
+    return model, tokenizer
+
+model, tokenizer = load_model_tokenizer()
+
+sexual_terms = ["젖", "벗어", "가슴", "엉덩이", "야짤", "야동", "섹", "성희롱", "물빼게", "몸매", "야해", "오빠가", "자위", "딸쳐", "야한", "ㅅㅅ", "ㅈㅇ", "ㅂㅈ"]
+positive_terms = ["최고", "멋져", "대박", "사랑", "감동", "짱", "인정", "굿", "감탄", "굉장해", "잘생겼", "예쁘", "잘했어", "레전드", "천재", "좋아"]
+
+def contains_sexual_harassment(text):
+    return any(term in text.lower() for term in sexual_terms)
+
+def is_positive_context(text):
+    return any(term in text.lower() for term in positive_terms)
+
+def final_decision(text, label):
+    if contains_sexual_harassment(text):
+        return "악성 (성희롱)"
+    elif label == 0 and is_positive_context(text):
+        return "정상 (욕설 + 칭찬)"
+    elif label == 0:
+        return "악성"
+    else:
+        return "정상"
+
+def predict_proba(text):
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs = torch.softmax(outputs.logits, dim=-1).squeeze().tolist()
+    return probs
+
+st.title("🛡️ 악성 댓글 탐지기 데모")
+comment = st.text_area("📝 댓글을 입력하세요:", "")
+
+if comment:
+    probs = predict_proba(comment)
+    label = int(torch.argmax(torch.tensor(probs)))
+    result = final_decision(comment, label)
+
+    st.markdown("---")
+    st.subheader("📊 예측 결과")
+    st.write(f"👉 **예측 결과:** {result}")
+    st.write(f"- 모델 라벨: {'악성' if label == 0 else '정상'} (확률 {probs[label]*100:.1f}%)")
+    if result == "정상 (욕설 + 칭찬)":
+        st.write("- 후처리 판단: **정상**")
+        st.write("- 위험도 레벨: 🟡 **주의 필요**")
+    elif "악성" in result:
+        st.write("- 위험도 레벨: 🔴 **위험**")
+    else:
+        st.write("- 위험도 레벨: 🔵 **정상**")
+
+    st.subheader("📈 분류 확률 시각화")
+    fig, ax = plt.subplots()
+    ax.bar(["Malicious", "Normal"], probs, color=["red", "blue"])
+    ax.set_ylim([0, 1])
+    ax.set_ylabel("Probability")
+    st.pyplot(fig)
+
+    st.markdown("---")
+    st.subheader("📌 활용 예시")
+    st.markdown("- 학교 게시판 자동 필터링 시스템")
+    st.markdown("- 연예인 기사 댓글 모니터링")
+    st.markdown("- 커뮤니티 운영자용 실시간 관리 툴")
+'''
+
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write(app_py_content)
+
+
+from google.colab import files
+files.download("requirements.txt")
+files.download("app.py")
